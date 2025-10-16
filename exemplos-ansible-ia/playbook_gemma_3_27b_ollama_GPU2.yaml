@@ -1,0 +1,222 @@
+- name: Setup inference node Gemma3
+  hosts: inference
+  become: true
+  vars:
+    cuda_keyring_deb: cuda-keyring_1.1-1_all.deb
+    cuda_keyring_url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/{{ cuda_keyring_deb }}"
+    cuda_pin_url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin"
+    cuda_pin_dest: /etc/apt/preferences.d/cuda-repository-pin-600
+    cuda_profile_path: /etc/profile.d/cuda.sh
+    ssl_cert_dir: /etc/nginx/ssl
+    ssl_cert_path: /etc/nginx/ssl/selfsigned.crt
+    ssl_key_path: /etc/nginx/ssl/selfsigned.key
+
+  tasks:
+
+    - name: Corrigir entrada duplicada de Signed-By no sources.list (Ubuntu Noble)
+      replace:
+        path: /etc/apt/sources.list
+        regexp: '^(deb http://archive.ubuntu.com/ubuntu noble)(.*)(signed-by=[^\s]+)?(.*)$'
+        replace: '\1\2\4'
+      when: ansible_distribution_release == "noble"
+
+    - name: Corrigir dependências quebradas se houver
+      shell: apt --fix-broken install -y
+      register: fix_broken_result
+      changed_when: "'Setting up' in fix_broken_result.stderr or 'installed' in fix_broken_result.stderr"
+
+    - name: Atualizar cache e pacotes
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        upgrade: dist
+
+    - name: Instalar pacotes básicos
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - git
+          - curl
+          - wget
+          - gnupg
+          - ca-certificates
+          - lsb-release
+          - software-properties-common
+        state: present
+
+    - name: Adicionar universo ao sources.list se não existir
+      when: ansible_facts['distribution'] == "Ubuntu"
+      lineinfile:
+        path: /etc/apt/sources.list
+        line: "deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }} universe"
+        state: present
+        insertafter: '^deb http://archive.ubuntu.com/ubuntu'
+
+    - name: Atualizar cache após adicionar universe
+      apt:
+        update_cache: yes
+
+    ### CUDA e NVidia drivers ###
+    - name: Baixar keyring do repositório CUDA se não existir
+      get_url:
+        url: "{{ cuda_keyring_url }}"
+        dest: "/tmp/{{ cuda_keyring_deb }}"
+        mode: "0644"
+      register: downloaded_keyring
+      changed_when: downloaded_keyring.changed
+
+    - name: Instalar keyring CUDA (dpkg)
+      apt:
+        deb: "/tmp/{{ cuda_keyring_deb }}"
+      register: dpkg_install
+      changed_when: dpkg_install.changed
+
+    - name: Atualizar cache do apt (com retry)
+      apt:
+        update_cache: yes
+      retries: 5
+      delay: 10
+      until: result is succeeded
+      register: result
+
+    - name: Instalar arquivo de prioridade para CUDA repo
+      get_url:
+        url: "{{ cuda_pin_url }}"
+        dest: "{{ cuda_pin_dest }}"
+        mode: "0644"
+
+    - name: Instalar componentes principais do CUDA 12.9 (sem nsight)
+      apt:
+        name:
+          - cuda-cudart-12-9
+          - cuda-compiler-12-9
+          - cuda-libraries-12-9
+          - cuda-nvcc-12-9
+        state: present
+
+    - name: Configurar variáveis de ambiente CUDA no /etc/profile.d/cuda.sh
+      blockinfile:
+        path: "{{ cuda_profile_path }}"
+        create: yes
+        block: |
+          export PATH=/usr/local/cuda/bin:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+    - name: Instalar driver NVIDIA versão 535
+      apt:
+        name: nvidia-driver-535
+        state: present
+
+    - name: Reiniciar a máquina após instalação do CUDA Toolkit (Ubuntu)
+      reboot:
+        reboot_timeout: 600
+      when: ansible_facts['distribution'] == "Ubuntu"
+
+    - name: Verificar driver NVIDIA com nvidia-smi
+      command: nvidia-smi
+      register: nvidia_output
+      ignore_errors: yes
+
+    - name: Exibir resultado do nvidia-smi
+      debug:
+        var: nvidia_output.stdout
+
+    ### Instalar Ollama ###
+    - name: Instalar Ollama com suporte a GPU
+      shell: curl -fsSL https://ollama.com/install.sh | sh
+      args:
+        executable: /bin/bash
+
+    - name: Criar diretório de configuração do Ollama
+      file:
+        path: /etc/ollama
+        state: directory
+        mode: '0755'
+
+    - name: Adicionar o usuário ao grupo 'ollama'
+      user:
+        name: "{{ ansible_user }}"
+        groups: ollama
+        append: yes
+  
+    - name: Escrever o arquivo de configuração do Ollama
+      copy:
+        dest: /etc/ollama/config.yaml
+        content: |
+          host: 0.0.0.0:8000
+        owner: root
+        group: root
+        mode: '0644'
+  
+    - name: Criar diretório de override do systemd para o Ollama
+      file:
+        path: /etc/systemd/system/ollama.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+  
+    - name: Criar override do systemd para o serviço ollama
+      copy:
+        dest: /etc/systemd/system/ollama.service.d/override.conf
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/local/bin/ollama serve
+          Environment=OLLAMA_HOST=0.0.0.0:8000
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Recarregar o systemd
+      command: systemctl daemon-reload
+
+    - name: Reiniciar o serviço ollama
+      systemd:
+        name: ollama
+        state: restarted
+        enabled: true
+  
+    - name: Esperar serviço Ollama estar escutando na porta 8000
+      wait_for:
+        host: "0.0.0.0"
+        port: 8000
+        timeout: 60
+  
+    - name: Verificar status do serviço Ollama
+      systemd:
+        name: ollama
+      register: ollama_service_status
+
+    - name: Exibir status do serviço Ollama
+      debug:
+        var: ollama_service_status.status
+
+    ### Baixar modelo Gemma 3 27B ###
+    - name: Baixar e preparar o modelo Gemma 3 27B (se disponível)
+      shell: OLLAMA_HOST=http://localhost:8000 ollama run gemma3:27b
+      args:
+        executable: /bin/bash
+      register: gemma_download
+      ignore_errors: yes
+
+    - name: Verificar saída do download do modelo
+      debug:
+        var: gemma_download.stdout
+
+     ### Liberar porta de inferência ###
+    - name: Abrir porta 11434 no firewall (caso UFW esteja ativo)
+      ufw:
+        rule: allow
+        port: 8000
+        proto: tcp
+
+    - name: Verificar se o serviço Ollama está rodando
+      shell: pgrep -af ollama
+      register: ollama_status
+      ignore_errors: true
+
+    - name: Exibir status do serviço Ollama
+      debug:
+        var: ollama_status.stdout
